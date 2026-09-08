@@ -150,6 +150,62 @@ officecli query "$FILE" 'field[fieldType!=page]'          # fields other than PA
 
 **Large documents.** Navigate by heading with `view outline` and jump with `query`; don't dump the whole body into context.
 
+### Extracting images
+
+Every picture has a backing binary — `get --save` writes it straight to disk. No export command needed.
+
+```bash
+officecli query "$FILE" picture --json | jq -r '.data.results[].path'
+officecli get "$FILE" '/body/p[3]/r[1]' --save out.png
+```
+
+The node reports `relId`, `width`, `height`, `alt`; a successful save adds `savedTo=`, `savedBytes=`, `savedContentType=`.
+
+**⚠️ `query picture` misses images inside floating shapes and textboxes.** A picture lives inside a run, but `query picture` only matches runs whose *direct* child is `<w:drawing>`. Images nested in a floating shape (`.../AlternateContent/Choice/drawing/.../wsp/txbx/txbxContent/p/r`) are never enumerated — yet they extract fine once the full path is known. Use two passes for a complete manifest:
+
+```bash
+# pass 1 — pictures hanging directly off a run
+officecli query "$FILE" picture --json | jq -r '.data.results[].path'
+# pass 2 — pictures nested inside shape/textbox containers
+officecli query "$FILE" AlternateContent --json | jq -r '.data.results[].path' | tr -d '\r' | while read p; do
+  officecli get "$FILE" "$p" --depth 12 | grep ' (picture) '
+done
+```
+
+**Windows: `tr -d '\r'` in pass 2 is mandatory, not cosmetic.** officecli emits CRLF, so `read p` captures a trailing `\r` and every `get` dies with `Malformed path segment 'AlternateContent[1]'. Expected 'name[index]'`. The `while read` loop silently produces zero output otherwise.
+
+`mc:AlternateContent` renders each shape twice — a DrawingML `Choice` branch and a VML `Fallback` branch carrying the **same** `r:embed`. Prefer `Choice`: the `Fallback` path shows up in a `--depth` dump but is not navigable, so `get --save` on it fails with `No textbox found ... Available children: fill/stroke/imagedata/lock/textbox`.
+
+**Dedupe by `relId`, not by path.** Choice and Fallback are two paths to one binary; exporting both writes the same image twice. If you need `alt` text in pass 2, use `get --json` — the plain-text dump mangles non-ASCII alt text in a non-UTF-8 terminal.
+
+Verified on a 32-image tender document: `query picture` alone found 28 (missing 4 ID photos embedded in a floating shape); two passes found all 32, every file byte-identical to `word/media/*`.
+
+### Annotating images in place (review comments)
+
+Comment anchors are **paragraph-level**: `<w:commentRangeStart>` is a sibling of `<w:r>`, never nested inside one. Annotate the paragraph that *hosts* the image, not the run.
+
+```bash
+# 1. target paragraphs — both passes, every path truncated at the run
+{ officecli query "$FILE" picture --json          | jq -r '.data.results[].path'
+  officecli query "$FILE" AlternateContent --json | jq -r '.data.results[].path'
+} | tr -d '\r' | sed 's#/r\[[0-9]*\].*##' | sort -u > /tmp/paras.txt
+
+# 2. one comment per paragraph
+while read p; do
+  officecli add "$FILE" "$p" --type comment \
+    --prop author="OCR审阅" --prop text="…"
+done < /tmp/paras.txt
+officecli save "$FILE"
+```
+
+Three traps here, and **all three fail silently**:
+
+1. **`query picture` misses floating shapes.** Anchoring off pass 1 alone annotates only the inline images and leaves every shape-hosted one unmarked — the exact images most likely to need review. Pass 2 is what finds them.
+2. **Never hand a textbox-internal path to `add`.** A `--depth 12` dump yields paths like `/body/p[X]/r[1]/AlternateContent[1]/Choice[1]/…/txbxContent[1]/p[1]/r[1]`. `add --type comment` on that exits 0 and prints `Added comment at /comments/comment[1]`, but the anchor lands **inside `txbxContent`** — the comment is trapped in the floating shape instead of sitting on the body line. `validate` still reports the baseline error count, so nothing flags it. The `sed 's#/r\[[0-9]*\].*##'` above is what prevents this. A plain run path `/body/p[X]/r[1]` is safe — officecli hoists it to the parent paragraph by itself.
+3. **Dedupe by paragraph, not by image.** One floating shape can carry four images; looping per image stacks four identical balloons on one line. `sort -u` on the truncated list handles it.
+
+Verified: 32 images across 11 paragraphs → 11 comments; `sort -u` collapses the 4 shape-hosted images to 1, and all 11 anchors land directly under `/body/p` (confirmed by walking the `commentRangeStart` ancestry — every one is `document/body/p/commentRangeStart`).
+
 ## Creating & Editing
 
 Verbs: `add` (new element), `set` (change a prop), `remove`, `move`, `swap`, `batch`, `raw-set` (last-resort XML). Ninety percent of a build is paragraphs, runs, tables, a couple of images, a TOC, and a footer.
@@ -414,7 +470,7 @@ officecli add "$FILE" /body --type equation --prop formula="\\frac{a}{b} + \\sum
 officecli add "$FILE" "/body/p[3]" --type footnote --prop text="See Appendix A for methodology."
 ```
 
-**Comments and tracked changes.** Bulk accept/reject: `set "$FILE" /revision --prop revision.action=accept` (or `--prop revision.action=reject`); narrow with a selector like `/revision[@author=Alice]` or `/revision[@type=ins]`. Locate individual changes with `query ins` and `query del` (`trackedchange` is not a selector). Create tracked changes on a run with `--prop revision.type=ins|del --prop revision.author=…` (`help docx run` for the full `revision.*` set — `format`/`moveFrom`/`moveTo` too). Add a comment: `add "/body/p[4]" --type comment --prop author=… --prop text=…`; reply-thread it with `--prop parentId=N` and mark it resolved with `set "/comments/comment[N]" --prop done=true` (resolve rather than delete to keep the audit trail — `query 'comment[done=false]'` then lists what's still open). Prop schema: `help docx comment` / `help docx run`.
+**Comments and tracked changes.** Bulk accept/reject: `set "$FILE" /revision --prop revision.action=accept` (or `--prop revision.action=reject`); narrow with a selector like `/revision[@author=Alice]` or `/revision[@type=ins]`. Locate individual changes with `query ins` and `query del` (`trackedchange` is not a selector). Create tracked changes on a run with `--prop revision.type=ins|del --prop revision.author=…` (`help docx run` for the full `revision.*` set — `format`/`moveFrom`/`moveTo` too). Add a comment: `add "/body/p[4]" --type comment --prop author=… --prop text=…`; reply-thread it with `--prop parentId=N` and mark it resolved with `set "/comments/comment[N]" --prop done=true` (resolve rather than delete to keep the audit trail — `query 'comment[done=false]'` then lists what's still open). Prop schema: `help docx comment` / `help docx run`. To comment on every image in a document, anchor on the **host paragraph** — see [Annotating images in place](#annotating-images-in-place-review-comments); `query picture` alone misses floating shapes.
 
 **Watermark.** `add / --type watermark --prop text="DRAFT" --prop color=BFBFBF --prop opacity=0.8` in one command (default opacity 0.5); `set /watermark --prop opacity=…` adjusts it later.
 
@@ -514,6 +570,7 @@ Before calling a color/field/chart broken, open the file in the user's target vi
 | Multiple bullet paragraphs in one cell | `c1="a\nb"` makes a `<w:br/>` line break (one paragraph); for separate bullet paragraphs use recipe (e) |
 | `raw-set` when dotted-attr would work | Prefer L2 dotted-attr over L3 raw-set |
 | Next paragraph inherits the previous Heading style | Set explicit `--prop style=Normal` on the following paragraph |
+| `add --type comment` with a textbox-internal path | Exits 0 but the anchor lands inside `txbxContent` — comment trapped in the shape. Truncate to the paragraph: `sed 's#/r\[[0-9]*\].*##'` |
 | Modifying a file open in Word | Close it in Word first |
 | Echo into batch breaks on `$`/`'` | Heredoc with single-quoted delimiter: `cat <<'EOF' \| officecli batch …` |
 

@@ -123,6 +123,15 @@ officecli get slides.pptx '/slide[1]' --depth 1          # list all shapes on sl
 officecli get data.xlsx '/Sheet1/B2' --json
 ```
 
+**`--save <file>` — extract the binary behind a node** (picture / OLE object / embedded media). Works on any node that carries a `relId`; the output gains `savedTo=`, `savedBytes=`, `savedContentType=`. There is no separate export command.
+
+```bash
+officecli get report.docx '/body/p[3]/r[1]' --save cover.png
+officecli query report.docx picture --json | jq -r '.data.results[].path'
+```
+
+docx caveat: `query picture` does **not** enumerate images nested inside floating shapes or textboxes (they are extractable once you know their full path) — use the two-pass recipe in the docx skill, "Extracting images".
+
 ### Stable ID Addressing
 
 Elements with stable IDs return `@attr=value` paths instead of positional indices. Prefer these in multi-step workflows — positional indices shift on insert/delete, stable IDs do not.
